@@ -1,0 +1,1054 @@
+use paqus::{
+    crypto::{
+        address_from_public_key, address_to_string, derive_public_key, generate_keypair, sign,
+    },
+    transaction::{SignedTransaction, Transaction},
+    types::{Address, Amount, Nonce, PublicKey, SecretKey},
+};
+use serde::Deserialize;
+use std::env;
+use std::fs;
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::process::ExitCode;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const DEFAULT_RPC_ADDR: &str = "127.0.0.1:6666";
+const RPC_ADDR_ENV: &str = "PAQUS_RPC_ADDR";
+const DEFAULT_WALLET_PATH: &str = "wallet.json";
+const DEFAULT_TRANSACTION_FEE: u32 = 1;
+const RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug)]
+struct Wallet {
+    address: Address,
+    public_key: PublicKey,
+    secret_key: SecretKey,
+}
+
+impl Wallet {
+    fn generate() -> Self {
+        let keypair = generate_keypair();
+        Self::from_keys(keypair.public_key, keypair.secret_key)
+    }
+
+    fn from_secret_key(secret_key: SecretKey) -> Self {
+        let public_key = derive_public_key(&secret_key);
+        Self::from_keys(public_key, secret_key)
+    }
+
+    fn from_keys(public_key: PublicKey, secret_key: SecretKey) -> Self {
+        Self {
+            address: address_from_public_key(&public_key),
+            public_key,
+            secret_key,
+        }
+    }
+
+    fn wallet_address(&self) -> String {
+        address_to_string(&self.address)
+    }
+
+    fn sign_transaction(&self, transaction: Transaction) -> Result<SignedTransaction, String> {
+        let signature = sign(&self.secret_key, &transaction.signing_bytes());
+        let signed = SignedTransaction::new(transaction, self.public_key, signature);
+        signed
+            .validate_signed()
+            .map_err(|error| format!("signed transaction failed validation: {error}"))?;
+        Ok(signed)
+    }
+}
+
+fn main() -> ExitCode {
+    match run(env::args().skip(1).collect()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(args: Vec<String>) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        None | Some("menu") | Some("cli") => interactive_menu(),
+        Some("-h") | Some("--help") | Some("help") => {
+            print_help();
+            Ok(())
+        }
+        Some("-V") | Some("--version") | Some("version") => {
+            println!("paqus-wallet {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("new") => wallet_new(&args[1..]),
+        Some("address") => wallet_address(&args[1..]),
+        Some("balance") => wallet_balance(&args[1..]),
+        Some("pay") => wallet_pay(&args[1..]),
+        Some("send") => wallet_send(&args[1..]),
+        Some(command) => Err(format!("unknown wallet command `{command}`. Try --help.")),
+    }
+}
+
+fn interactive_menu() -> Result<(), String> {
+    loop {
+        println!();
+        println!("Paqus Wallet CLI");
+        println!("1. Create wallet");
+        println!("2. Show wallet address");
+        println!("3. Check wallet balance");
+        println!("4. Send coin");
+        println!("5. RPC health");
+        println!("6. RPC status");
+        println!("7. RPC peers");
+        println!("8. RPC chain");
+        println!("9. Latest blocks");
+        println!("10. Block by height");
+        println!("11. Block by hash");
+        println!("12. Transaction by hash");
+        println!("13. Address explorer");
+        println!("14. Accounts");
+        println!("15. Mempool");
+        println!("16. Change RPC for this session");
+        println!("17. Exit");
+        println!("Type b/back to return from prompts.");
+
+        let choice = prompt("Select")?;
+        if choice == "17" {
+            return Ok(());
+        }
+        match handle_menu_choice(&choice) {
+            Ok(true) => pause_for_menu()?,
+            Ok(false) => {}
+            Err(error) => {
+                println!("error: {error}");
+                println!("Returning to menu.");
+                pause_for_menu()?;
+            }
+        }
+    }
+}
+
+fn handle_menu_choice(choice: &str) -> Result<bool, String> {
+    match choice {
+        "b" | "back" => {}
+        "1" => {
+            let Some(path) = prompt_default_back("Wallet file", DEFAULT_WALLET_PATH)? else {
+                return Ok(false);
+            };
+            wallet_new(&[path])?;
+            return Ok(true);
+        }
+        "2" => {
+            let Some(wallet_path) = prompt_default_back("Wallet file", DEFAULT_WALLET_PATH)? else {
+                return Ok(false);
+            };
+            let wallet = load_wallet(&wallet_path)?;
+            println!("{}", wallet.wallet_address());
+            return Ok(true);
+        }
+        "3" => {
+            let Some(wallet_path) = prompt_default_back("Wallet file path", DEFAULT_WALLET_PATH)?
+            else {
+                return Ok(false);
+            };
+            let rpc_addr = default_rpc_addr();
+            let wallet = load_wallet(&wallet_path)?;
+            print_rpc_get(&rpc_addr, &format!("/balance/{}", wallet.wallet_address()))?;
+            return Ok(true);
+        }
+        "4" => return menu_send_coin(),
+        "5" => menu_rpc_get("/health")?,
+        "6" => menu_rpc_get("/status")?,
+        "7" => menu_rpc_get("/peers")?,
+        "8" => menu_rpc_get("/chain")?,
+        "9" => menu_rpc_get("/blocks/latest")?,
+        "10" => {
+            let Some(height) = prompt_back("Height")? else {
+                return Ok(false);
+            };
+            menu_rpc_get(&format!("/blocks/{height}"))?;
+        }
+        "11" => {
+            let Some(hash) = prompt_back("Block hash")? else {
+                return Ok(false);
+            };
+            menu_rpc_get(&format!("/blocks/hash/{hash}"))?;
+        }
+        "12" => {
+            let Some(hash) = prompt_back("Transaction hash")? else {
+                return Ok(false);
+            };
+            menu_rpc_get(&format!("/tx/{hash}"))?;
+        }
+        "13" => {
+            let Some(address) = prompt_default_back("Address", &default_wallet_address_or_empty())?
+            else {
+                return Ok(false);
+            };
+            if address.is_empty() {
+                println!("No address entered and wallet.json could not be loaded.");
+            } else {
+                menu_rpc_get(&format!("/address/{address}"))?;
+            }
+        }
+        "14" => menu_rpc_get("/accounts")?,
+        "15" => menu_rpc_get("/mempool")?,
+        "16" => {
+            let Some(rpc_addr) = prompt_default_back("RPC address", &default_rpc_addr())? else {
+                return Ok(false);
+            };
+            // SAFETY: This CLI is single-threaded while the menu is active.
+            unsafe {
+                env::set_var(RPC_ADDR_ENV, rpc_addr);
+            }
+            println!("RPC address set to {}", default_rpc_addr());
+        }
+        value => {
+            println!("Unknown menu `{value}`");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn menu_send_coin() -> Result<bool, String> {
+    let Some(to) = prompt_back("Recipient address")? else {
+        return Ok(false);
+    };
+    let Some(amount) = prompt_back("Amount")? else {
+        return Ok(false);
+    };
+    let Some(fee) = prompt_default_back("Fee", &DEFAULT_TRANSACTION_FEE.to_string())? else {
+        return Ok(false);
+    };
+    let Some(wallet_path) = prompt_default_back("Wallet file", DEFAULT_WALLET_PATH)? else {
+        return Ok(false);
+    };
+    let rpc_addr = default_rpc_addr();
+    wallet_send_short(&[
+        to,
+        amount,
+        "--fee".to_string(),
+        fee,
+        "--wallet".to_string(),
+        wallet_path,
+        "--rpc".to_string(),
+        rpc_addr,
+    ])?;
+    Ok(true)
+}
+
+fn menu_rpc_get(path: &str) -> Result<(), String> {
+    let rpc_addr = default_rpc_addr();
+    print_rpc_get(&rpc_addr, path)
+}
+
+fn print_rpc_get(rpc_addr: &str, path: &str) -> Result<(), String> {
+    let body = http_get(rpc_addr, path)?;
+    print_rpc_response(path, &body)
+}
+
+fn print_rpc_response(path: &str, body: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("failed to parse rpc response: {error}: {body}"))?;
+    if path == "/health" {
+        print_health(&value);
+    } else if path == "/status" {
+        print_status(&value);
+    } else if path == "/chain" {
+        print_chain(&value);
+    } else if path == "/peers" {
+        print_peers(&value);
+    } else if path.starts_with("/balance/") {
+        print_balance(&value);
+    } else if path == "/blocks/latest" {
+        print_latest_blocks(&value);
+    } else if path.starts_with("/blocks/") || path.starts_with("/blocks/hash/") {
+        print_block(&value);
+    } else if path.starts_with("/tx/") {
+        print_transaction(&value);
+    } else if path.starts_with("/address/") {
+        print_address(&value);
+    } else if path == "/accounts" {
+        print_accounts(&value);
+    } else if path == "/mempool" {
+        print_mempool(&value);
+    } else {
+        print_pretty_json(&value);
+    }
+    Ok(())
+}
+
+fn print_health(value: &serde_json::Value) {
+    println!("Health");
+    print_field("OK", bool_text(value.get("ok")));
+}
+
+fn print_status(value: &serde_json::Value) {
+    println!("Node Status");
+    print_field("Chain", str_value(value.get("chain")));
+    print_field("Stage", str_value(value.get("stage")));
+    print_field("Protocol", value_text(value.get("protocol_version")));
+    print_field("Height", value_text(value.get("height")));
+    print_field("Tip", short_value(value.get("tip_hash")));
+    print_field("Peers", value_text(value.get("peers")));
+    print_field("Mining", bool_text(value.get("mining")));
+}
+
+fn print_chain(value: &serde_json::Value) {
+    println!("Chain");
+    print_field("Name", str_value(value.get("chain")));
+    print_field("Coin", str_value(value.get("coin")));
+    print_field("Stage", str_value(value.get("stage")));
+    print_field("Protocol", value_text(value.get("protocol_version")));
+    print_field(
+        "Block time",
+        format!("{} sec", value_text(value.get("block_time_secs"))),
+    );
+    print_field("Confirmation", value_text(value.get("confirmation_depth")));
+    print_field("Finality", value_text(value.get("finality_depth")));
+    print_field("Difficulty", value_text(value.get("difficulty_start")));
+}
+
+fn print_peers(value: &serde_json::Value) {
+    let Some(peers) = value.as_array() else {
+        print_pretty_json(value);
+        return;
+    };
+    println!("Peers ({})", peers.len());
+    for (index, peer) in peers.iter().enumerate() {
+        println!();
+        println!("Peer #{}", index + 1);
+        print_field("Address", str_value(peer.get("addr")));
+        print_field("Failures", value_text(peer.get("failures")));
+        print_field("Last tip", value_text(peer.get("last_tip")));
+    }
+}
+
+fn print_balance(value: &serde_json::Value) {
+    println!("Balance");
+    print_field("Address", short_value(value.get("address")));
+    print_field("Height", value_text(value.get("height")));
+    print_field("Exists", bool_text(value.get("exists")));
+    print_field("Confirmed", value_text(value.get("confirmed")));
+    print_field("Available", value_text(value.get("available")));
+    print_field("Incoming", value_text(value.get("pending_incoming")));
+    print_field("Outgoing", value_text(value.get("pending_outgoing")));
+    print_field("Nonce", value_text(value.get("nonce")));
+    print_field("Unspendable", value_text(value.get("unspendable")));
+}
+
+fn print_latest_blocks(value: &serde_json::Value) {
+    let Some(blocks) = value.as_array() else {
+        print_pretty_json(value);
+        return;
+    };
+    println!("Latest Blocks ({})", blocks.len());
+    for block in blocks {
+        println!();
+        print_block(block);
+    }
+}
+
+fn print_block(value: &serde_json::Value) {
+    println!("Block #{}", value_text(value.get("height")));
+    print_field("Hash", short_value(value.get("hash")));
+    print_field("Previous", short_value(value.get("previous_hash")));
+    print_field("Miner", short_value(value.get("miner_address")));
+    print_field("Difficulty", value_text(value.get("difficulty")));
+    print_field("Nonce", value_text(value.get("nonce")));
+    print_field("Tx count", value_text(value.get("tx_count")));
+    print_field("Size", format!("{} bytes", value_text(value.get("size"))));
+    if let Some(coinbase) = value.get("coinbase").and_then(serde_json::Value::as_object) {
+        let total = value_text(coinbase.get("total"));
+        let to = short_value(coinbase.get("to"));
+        print_field("Coinbase", format!("{total} to {to}"));
+        print_field("Fees", value_text(coinbase.get("fees")));
+    }
+    print_field("Timestamp", value_text(value.get("timestamp")));
+    print_transactions(value.get("transactions"));
+}
+
+fn print_transaction(value: &serde_json::Value) {
+    println!("Transaction");
+    print_tx_fields(value);
+}
+
+fn print_address(value: &serde_json::Value) {
+    println!("Address");
+    print_field("Address", short_value(value.get("address")));
+    if let Some(balance) = value.get("balance") {
+        println!();
+        print_balance(balance);
+    }
+    print_transactions(value.get("transactions"));
+}
+
+fn print_accounts(value: &serde_json::Value) {
+    let Some(accounts) = value.as_array() else {
+        print_pretty_json(value);
+        return;
+    };
+    println!("Accounts ({})", accounts.len());
+    for (index, account) in accounts.iter().enumerate() {
+        println!();
+        println!("Account #{}", index + 1);
+        print_field("Address", short_value(account.get("address")));
+        print_field("Confirmed", value_text(account.get("confirmed")));
+        print_field("Available", value_text(account.get("available")));
+        print_field("Unspendable", value_text(account.get("unspendable")));
+        print_field("Incoming", value_text(account.get("pending_incoming")));
+        print_field("Outgoing", value_text(account.get("pending_outgoing")));
+        print_field("Nonce", value_text(account.get("nonce")));
+        print_field("Credits", value_text(account.get("credits")));
+    }
+}
+
+fn print_mempool(value: &serde_json::Value) {
+    println!("Mempool");
+    print_field("Size", value_text(value.get("size")));
+    print_transactions(value.get("transactions"));
+}
+
+fn print_transactions(value: Option<&serde_json::Value>) {
+    let Some(transactions) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    println!();
+    println!("Transactions ({})", transactions.len());
+    for (index, tx) in transactions.iter().enumerate() {
+        println!();
+        println!("Tx #{}", index + 1);
+        print_tx_fields(tx);
+    }
+}
+
+fn print_tx_fields(value: &serde_json::Value) {
+    print_field("Hash", short_value(value.get("hash")));
+    print_field("From", short_value(value.get("from")));
+    print_field("To", short_value(value.get("to")));
+    print_field("Amount", value_text(value.get("amount")));
+    print_field("Fee", value_text(value.get("fee")));
+    print_field("Nonce", value_text(value.get("nonce")));
+    print_field("Height", value_text(value.get("block_height")));
+    print_field("Block", short_value(value.get("block_hash")));
+    print_field("Status", str_value(value.get("status")));
+}
+
+fn print_field(label: &str, value: impl std::fmt::Display) {
+    println!("{label:<10} : {value}");
+}
+
+fn print_pretty_json(value: &serde_json::Value) {
+    match serde_json::to_string_pretty(value) {
+        Ok(pretty) => println!("{pretty}"),
+        Err(_) => println!("{value}"),
+    }
+}
+
+fn value_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::Null) | None => "none".to_string(),
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+    }
+}
+
+fn str_value(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| value_text(value))
+}
+
+fn short_value(value: Option<&serde_json::Value>) -> String {
+    short_text(&str_value(value))
+}
+
+fn bool_text(value: Option<&serde_json::Value>) -> &'static str {
+    match value.and_then(serde_json::Value::as_bool) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn short_text(value: &str) -> String {
+    if value.len() <= 24 || value == "none" {
+        value.to_string()
+    } else {
+        format!("{}...{}", &value[..8], &value[value.len() - 8..])
+    }
+}
+
+fn wallet_new(args: &[String]) -> Result<(), String> {
+    let show_secret = args.iter().any(|arg| arg == "--show-secret");
+    let output_path = args.iter().find(|arg| !arg.starts_with('-'));
+    let wallet = Wallet::generate();
+
+    let address_str = wallet.wallet_address().to_string();
+    let public_key_hex = hex::encode(wallet.public_key.0);
+    let secret_key_hex = hex::encode(wallet.secret_key.0);
+
+    if let Some(path) = output_path {
+        let json_data = serde_json::json!({
+            "address": address_str,
+            "public_key": public_key_hex,
+            "secret_key": secret_key_hex,
+        });
+        let json_str = serde_json::to_string_pretty(&json_data)
+            .map_err(|error| format!("failed to serialize wallet: {error}"))?;
+        fs::write(path, json_str)
+            .map_err(|error| format!("failed to write wallet file `{path}`: {error}"))?;
+        println!("Wallet successfully saved to `{path}`");
+        println!("address: {address_str}");
+        if show_secret {
+            println!("secret_key: {secret_key_hex}");
+        }
+    } else {
+        println!("address: {address_str}");
+        println!("public_key: {public_key_hex}");
+        if show_secret {
+            println!("secret_key: {secret_key_hex}");
+        } else {
+            println!("secret_key: hidden (rerun with --show-secret to print it)");
+        }
+    }
+    Ok(())
+}
+
+fn wallet_address(args: &[String]) -> Result<(), String> {
+    let secret_key = parse_secret_key(args.first())?;
+    let public_key = derive_public_key(&secret_key);
+    let address = address_from_public_key(&public_key);
+    println!("{}", address_to_string(&address));
+    Ok(())
+}
+
+fn wallet_balance(args: &[String]) -> Result<(), String> {
+    let mut address = None;
+    let mut wallet_path = DEFAULT_WALLET_PATH.to_string();
+    let mut rpc_addr = default_rpc_addr();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wallet" => {
+                index += 1;
+                wallet_path = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --wallet".to_string())?
+                    .clone();
+            }
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            value if !value.starts_with('-') && address.is_none() => {
+                address = Some(parse_address(args.get(index))?);
+            }
+            value => return Err(format!("unknown wallet balance option `{value}`")),
+        }
+        index += 1;
+    }
+
+    let address = match address {
+        Some(address) => address,
+        None => load_wallet(&wallet_path)?.address,
+    };
+
+    println!(
+        "{}",
+        http_get(
+            &rpc_addr,
+            &format!("/balance/{}", address_to_string(&address))
+        )?
+    );
+    Ok(())
+}
+
+fn wallet_pay(args: &[String]) -> Result<(), String> {
+    let to = parse_address(args.first())?;
+    let amount = parse_amount(args.get(1), "amount")?;
+    let mut wallet_path = DEFAULT_WALLET_PATH.to_string();
+    let mut rpc_addr = default_rpc_addr();
+    let mut fee = Amount(DEFAULT_TRANSACTION_FEE);
+    let mut index = 2;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wallet" => {
+                index += 1;
+                wallet_path = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --wallet".to_string())?
+                    .clone();
+            }
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            "--fee" => {
+                index += 1;
+                fee = parse_amount(args.get(index), "--fee")?;
+            }
+            value => return Err(format!("unknown wallet pay option `{value}`")),
+        }
+        index += 1;
+    }
+
+    submit_wallet_payment(&wallet_path, to, amount, fee, None, &rpc_addr)
+}
+
+fn wallet_send(args: &[String]) -> Result<(), String> {
+    let short_form = args.len() >= 2 && !args[0].starts_with('-') && !args[1].starts_with('-');
+    if short_form {
+        return wallet_send_short(args);
+    }
+
+    let mut wallet_path = DEFAULT_WALLET_PATH.to_string();
+    let mut to = None;
+    let mut amount = None;
+    let mut fee = Amount(DEFAULT_TRANSACTION_FEE);
+    let mut nonce = None;
+    let mut rpc_addr = default_rpc_addr();
+    let mut submit = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wallet" => {
+                index += 1;
+                wallet_path = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --wallet".to_string())?
+                    .clone();
+            }
+            "--to" => {
+                index += 1;
+                to = Some(parse_address(args.get(index))?);
+            }
+            "--amount" => {
+                index += 1;
+                amount = Some(parse_amount(args.get(index), "--amount")?);
+            }
+            "--fee" => {
+                index += 1;
+                fee = parse_amount(args.get(index), "--fee")?;
+            }
+            "--nonce" => {
+                index += 1;
+                nonce = Some(parse_nonce(args.get(index))?);
+            }
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            "--submit" => submit = true,
+            value => return Err(format!("unknown wallet send option `{value}`")),
+        }
+        index += 1;
+    }
+
+    let to = to.ok_or_else(|| "missing --to address".to_string())?;
+    let amount = amount.ok_or_else(|| "missing --amount".to_string())?;
+    submit_wallet_transaction(&wallet_path, to, amount, fee, nonce, &rpc_addr, submit)
+}
+
+fn wallet_send_short(args: &[String]) -> Result<(), String> {
+    let to = parse_address(args.first())?;
+    let amount = parse_amount(args.get(1), "amount")?;
+    let mut wallet_path = DEFAULT_WALLET_PATH.to_string();
+    let mut rpc_addr = default_rpc_addr();
+    let mut fee = Amount(DEFAULT_TRANSACTION_FEE);
+    let mut nonce = None;
+    let mut index = 2;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wallet" => {
+                index += 1;
+                wallet_path = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --wallet".to_string())?
+                    .clone();
+            }
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            "--fee" => {
+                index += 1;
+                fee = parse_amount(args.get(index), "--fee")?;
+            }
+            "--nonce" => {
+                index += 1;
+                nonce = Some(parse_nonce(args.get(index))?);
+            }
+            value => return Err(format!("unknown wallet send option `{value}`")),
+        }
+        index += 1;
+    }
+
+    submit_wallet_payment(&wallet_path, to, amount, fee, nonce, &rpc_addr)
+}
+
+fn submit_wallet_payment(
+    wallet_path: &str,
+    to: Address,
+    amount: Amount,
+    fee: Amount,
+    nonce: Option<Nonce>,
+    rpc_addr: &str,
+) -> Result<(), String> {
+    submit_wallet_transaction(wallet_path, to, amount, fee, nonce, rpc_addr, true)
+}
+
+fn submit_wallet_transaction(
+    wallet_path: &str,
+    to: Address,
+    amount: Amount,
+    fee: Amount,
+    nonce: Option<Nonce>,
+    rpc_addr: &str,
+    submit: bool,
+) -> Result<(), String> {
+    let wallet = load_wallet(wallet_path)?;
+    let nonce = nonce.unwrap_or(resolve_wallet_nonce(&wallet.address, rpc_addr)?);
+    let transaction =
+        Transaction::new_at(wallet.address, to, amount, fee, nonce, unix_timestamp()?);
+    let signed = wallet
+        .sign_transaction(transaction)
+        .map_err(|error| format!("failed to sign transaction: {error}"))?;
+    let tx_hex = signed_transaction_to_hex(&signed)?;
+
+    if submit {
+        let body = format!("{{\"tx\":\"{tx_hex}\"}}");
+        let response = http_post_json(rpc_addr, "/tx", &body)?;
+        println!("{response}");
+    } else {
+        println!(
+            "{{\"tx\":\"{}\",\"hash\":\"{}\",\"from\":\"{}\",\"to\":\"{}\",\"amount\":{},\"fee\":{},\"nonce\":{},\"timestamp\":{}}}",
+            tx_hex,
+            hex::encode(signed.hash().0),
+            address_to_string(&signed.transaction.from),
+            address_to_string(&signed.transaction.to),
+            signed.transaction.amount.0,
+            signed.transaction.fee.0,
+            signed.transaction.nonce.0,
+            signed.transaction.timestamp
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_wallet_nonce(address: &Address, rpc_addr: &str) -> Result<Nonce, String> {
+    let address_hex = address_to_string(address);
+    let balance_body = http_get(rpc_addr, &format!("/balance/{address_hex}"))?;
+    let balance: BalanceRpcResponse = serde_json::from_str(&balance_body)
+        .map_err(|error| format!("failed to parse balance rpc response: {error}"))?;
+    let mut next_nonce = balance.nonce.unwrap_or(0);
+
+    let mempool_body = http_get(rpc_addr, "/mempool")?;
+    let mempool: MempoolRpcResponse = serde_json::from_str(&mempool_body)
+        .map_err(|error| format!("failed to parse mempool rpc response: {error}"))?;
+    let mut pending_nonces = mempool
+        .transactions
+        .into_iter()
+        .filter_map(|transaction| (transaction.from == address_hex).then_some(transaction.nonce))
+        .collect::<Vec<_>>();
+    pending_nonces.sort_unstable();
+    pending_nonces.dedup();
+
+    for nonce in pending_nonces {
+        if nonce == next_nonce {
+            next_nonce = next_nonce.saturating_add(1);
+        } else if nonce > next_nonce {
+            break;
+        }
+    }
+
+    Ok(Nonce(next_nonce))
+}
+
+#[derive(Debug, Deserialize)]
+struct BalanceRpcResponse {
+    nonce: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MempoolRpcResponse {
+    transactions: Vec<MempoolTxRpcResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MempoolTxRpcResponse {
+    from: String,
+    nonce: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletFile {
+    address: String,
+    secret_key: String,
+}
+
+fn load_wallet(path: &str) -> Result<Wallet, String> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read wallet file {path}: {error}"))?;
+    let wallet: WalletFile = serde_json::from_str(&contents)
+        .map_err(|error| format!("failed to parse wallet file {path}: {error}"))?;
+    let address = parse_address_hex(&wallet.address)?;
+    let secret_key = parse_secret_key(Some(&wallet.secret_key))?;
+    let wallet = Wallet::from_secret_key(secret_key);
+    if wallet.address != address {
+        return Err("wallet address does not match secret key".to_string());
+    }
+    Ok(wallet)
+}
+
+fn signed_transaction_to_hex(transaction: &SignedTransaction) -> Result<String, String> {
+    Ok(hex::encode(transaction.to_bytes()))
+}
+
+fn parse_secret_key(value: Option<&String>) -> Result<SecretKey, String> {
+    let Some(value) = value else {
+        return Err("missing secret key hex".to_string());
+    };
+    let bytes = hex::decode(value).map_err(|_| "invalid secret key hex".to_string())?;
+    let bytes = bytes
+        .try_into()
+        .map_err(|_| "secret key has invalid length".to_string())?;
+    Ok(SecretKey(bytes))
+}
+
+fn parse_address(value: Option<&String>) -> Result<Address, String> {
+    let Some(value) = value else {
+        return Err("missing address hex".to_string());
+    };
+    parse_address_hex(value)
+}
+
+fn parse_address_hex(value: &str) -> Result<Address, String> {
+    let bytes = hex::decode(value).map_err(|_| "invalid address hex".to_string())?;
+    let bytes = bytes
+        .try_into()
+        .map_err(|_| "address has invalid length".to_string())?;
+    Ok(Address(bytes))
+}
+
+fn parse_amount(value: Option<&String>, flag: &str) -> Result<Amount, String> {
+    let value = value.ok_or_else(|| format!("missing value for {flag}"))?;
+    value
+        .parse::<u32>()
+        .map(Amount)
+        .map_err(|error| format!("invalid amount for {flag}: {error}"))
+}
+
+fn parse_nonce(value: Option<&String>) -> Result<Nonce, String> {
+    let value = value.ok_or_else(|| "missing value for --nonce".to_string())?;
+    value
+        .parse::<u64>()
+        .map(Nonce)
+        .map_err(|error| format!("invalid nonce: {error}"))
+}
+
+fn unix_timestamp() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| "system clock is before unix epoch".to_string())
+}
+
+fn http_post_json(addr: &str, path: &str, body: &str) -> Result<String, String> {
+    let addr = addr
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid rpc address: {error}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|error| format!("failed to connect rpc: {error}"))?;
+    configure_stream(&stream)?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("failed to write rpc request: {error}"))?;
+    read_http_response(stream)
+}
+
+fn http_get(addr: &str, path: &str) -> Result<String, String> {
+    let addr = addr
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid rpc address: {error}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|error| format!("failed to connect rpc: {error}"))?;
+    configure_stream(&stream)?;
+    let request = format!("GET {path} HTTP/1.1\r\nhost: {addr}\r\nconnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("failed to write rpc request: {error}"))?;
+    read_http_response(stream)
+}
+
+fn configure_stream(stream: &TcpStream) -> Result<(), String> {
+    stream
+        .set_read_timeout(Some(RPC_HTTP_TIMEOUT))
+        .map_err(|error| format!("failed to set read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(RPC_HTTP_TIMEOUT))
+        .map_err(|error| format!("failed to set write timeout: {error}"))?;
+    Ok(())
+}
+
+fn read_http_response(mut stream: TcpStream) -> Result<String, String> {
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                response.extend_from_slice(&buffer[..bytes_read]);
+                if response_body_complete(&response)? {
+                    break;
+                }
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                if response_body_complete(&response)? {
+                    break;
+                }
+                return Err(
+                    "failed to read rpc response: timed out waiting for node response".to_string(),
+                );
+            }
+            Err(error) => return Err(format!("failed to read rpc response: {error}")),
+        }
+    }
+    let response = String::from_utf8(response)
+        .map_err(|error| format!("failed to decode rpc response: {error}"))?;
+    Ok(response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or(response))
+}
+
+fn response_body_complete(response: &[u8]) -> Result<bool, String> {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(false);
+    };
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|error| format!("failed to decode rpc response headers: {error}"))?;
+    let Some(content_length) = headers.lines().find_map(content_length) else {
+        return Ok(false);
+    };
+    Ok(response.len() >= header_end + 4 + content_length)
+}
+
+fn content_length(line: &str) -> Option<usize> {
+    let (name, value) = line.split_once(':')?;
+    name.eq_ignore_ascii_case("content-length")
+        .then(|| value.trim().parse().ok())
+        .flatten()
+}
+
+fn default_rpc_addr() -> String {
+    env::var(RPC_ADDR_ENV).unwrap_or_else(|_| DEFAULT_RPC_ADDR.to_string())
+}
+
+fn default_wallet_address_or_empty() -> String {
+    load_wallet(DEFAULT_WALLET_PATH)
+        .map(|wallet| wallet.wallet_address())
+        .unwrap_or_default()
+}
+
+fn prompt(label: &str) -> Result<String, String> {
+    print!("{label}: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush stdout: {error}"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| format!("failed to read input: {error}"))?;
+    Ok(line.trim().to_string())
+}
+
+fn prompt_back(label: &str) -> Result<Option<String>, String> {
+    let value = prompt(&format!("{label} (b/back to menu)"))?;
+    if is_back(&value) {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn prompt_default(label: &str, default: &str) -> Result<String, String> {
+    print!("{label} [{default}]: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("failed to flush stdout: {error}"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|error| format!("failed to read input: {error}"))?;
+    let value = line.trim();
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn prompt_default_back(label: &str, default: &str) -> Result<Option<String>, String> {
+    let value = prompt_default(&format!("{label} (b/back to menu)"), default)?;
+    if is_back(&value) {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn pause_for_menu() -> Result<(), String> {
+    let _ = prompt("Press Enter or type b/back to return to menu")?;
+    Ok(())
+}
+
+fn is_back(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "b" | "back")
+}
+
+fn print_help() {
+    println!(
+        "\
+paqus-wallet
+
+Usage:
+  paqus-wallet
+  paqus-wallet menu
+  paqus-wallet new [wallet-path] [--show-secret]
+  paqus-wallet address <secret-key-hex>
+  paqus-wallet balance [address-hex] [--wallet path] [--rpc host:port]
+  paqus-wallet pay <address-hex> <amount> [--wallet path] [--fee units] [--rpc host:port]
+  paqus-wallet send <address-hex> <amount> [--wallet path] [--nonce n] [--fee units] [--rpc host:port]
+  paqus-wallet send [--wallet path] --to address-hex --amount units [--nonce n] [--fee units] [--submit] [--rpc host:port]
+
+Defaults:
+  Wallet path: wallet.json
+  RPC address: $PAQUS_RPC_ADDR or 127.0.0.1:6666
+"
+    );
+}

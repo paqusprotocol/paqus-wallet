@@ -1,0 +1,4 @@
+/target/
+wallet.json
+*.wallet.json
+*.log
