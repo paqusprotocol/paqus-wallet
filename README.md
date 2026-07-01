@@ -89,7 +89,7 @@ By default the wallet uses node RPC at
 your node uses another RPC address:
 
 ```bash
-export PAQUS_RPC_ADDR='[2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666'
+export PAQUS_RPC_ADDR='[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666'
 ```
 
 You can still override one command with `--rpc <host:port>`.
@@ -127,7 +127,7 @@ Expected output should show `*:6666` or `[::]:6666`.
 Test RPC from the wallet machine:
 
 ```bash
-curl 'http://[2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666/health'
+curl 'http://[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666/health'
 ```
 
 Keep public RPC access limited when possible.
