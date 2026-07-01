@@ -35,14 +35,34 @@ Check balance through a running node RPC:
 cargo run -- balance
 ```
 
+Track global mined supply, target supply, transaction count, fees, and transfer
+volume:
+
+```bash
+cargo run -- stats
+```
+
+Track mined coin, matured mining rewards, collected mining fees, and transaction
+totals for one address:
+
+```bash
+cargo run -- address-stats
+```
+
+View node mining hashrate through RPC:
+
+```bash
+cargo run -- hashrate
+```
+
 Send a transaction:
 
 ```bash
-cargo run -- send <recipient-address-hex> 10 --fee 1
+cargo run -- send <recipient-address-hex> 10 --fee 0.01
 ```
 
-`10` is the amount, and `--fee 1` is the transaction fee. If `--fee` is omitted,
-the wallet uses the default fee of `1`.
+`10` is `10.00 XPQ`, and `--fee 0.01` is `0.01 XPQ`. If `--fee` is omitted,
+the wallet uses the default fee of `0.01 XPQ`.
 Both commands use `wallet.json` by default.
 
 Print signed transaction hex without broadcasting:
@@ -51,7 +71,7 @@ Print signed transaction hex without broadcasting:
 cargo run -- send \
   --to <recipient-address-hex> \
   --amount 10 \
-  --fee 1
+  --fee 0.01
 ```
 
 Broadcast the advanced form:
@@ -60,16 +80,16 @@ Broadcast the advanced form:
 cargo run -- send \
   --to <recipient-address-hex> \
   --amount 10 \
-  --fee 1 \
+  --fee 0.01 \
   --submit
 ```
 
 By default the wallet uses node RPC at
-`[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666`. Set `PAQUS_RPC_ADDR` once if
+`[2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666`. Set `PAQUS_RPC_ADDR` once if
 your node uses another RPC address:
 
 ```bash
-export PAQUS_RPC_ADDR='[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666'
+export PAQUS_RPC_ADDR='[2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666'
 ```
 
 You can still override one command with `--rpc <host:port>`.
@@ -86,7 +106,7 @@ PAQUS_RPC_ADDR='<host-or-ip>:6666' cargo run
 For IPv6 addresses, wrap the address in brackets:
 
 ```bash
-PAQUS_RPC_ADDR='[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666' cargo run
+PAQUS_RPC_ADDR='[2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666' cargo run
 ```
 
 The node must listen on an address reachable by the wallet. On a server, bind RPC
@@ -107,7 +127,7 @@ Expected output should show `*:6666` or `[::]:6666`.
 Test RPC from the wallet machine:
 
 ```bash
-curl 'http://[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666/health'
+curl 'http://[2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666/health'
 ```
 
 Keep public RPC access limited when possible.
@@ -120,9 +140,12 @@ paqus-wallet menu
 paqus-wallet new [wallet-path] [--show-secret]
 paqus-wallet address <secret-key-hex>
 paqus-wallet balance [address-hex] [--wallet path] [--rpc host:port]
-paqus-wallet pay <address-hex> <amount> [--wallet path] [--fee units] [--rpc host:port]
-paqus-wallet send <address-hex> <amount> [--wallet path] [--nonce n] [--fee units] [--rpc host:port]
-paqus-wallet send [--wallet path] --to address-hex --amount units [--nonce n] [--fee units] [--submit] [--rpc host:port]
+paqus-wallet stats [--rpc host:port]
+paqus-wallet address-stats [address-hex] [--wallet path] [--rpc host:port]
+paqus-wallet hashrate [--rpc host:port]
+paqus-wallet pay <address-hex> <amount-xpq> [--wallet path] [--fee xpq] [--rpc host:port]
+paqus-wallet send <address-hex> <amount-xpq> [--wallet path] [--nonce n] [--fee xpq] [--rpc host:port]
+paqus-wallet send [--wallet path] --to address-hex --amount xpq [--nonce n] [--fee xpq] [--submit] [--rpc host:port]
 ```
 
 Commands use `wallet.json` by default. Pass `--wallet <path>` only when you want

@@ -2,6 +2,7 @@ use paqus::{
     crypto::{
         address_from_public_key, address_to_string, derive_public_key, generate_keypair, sign,
     },
+    params::{BLOCK_REWARD_MATURITY, XPQ},
     transaction::{SignedTransaction, Transaction},
     types::{Address, Amount, Nonce, PublicKey, SecretKey},
 };
@@ -13,10 +14,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_RPC_ADDR: &str = "[2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666";
+const DEFAULT_RPC_ADDR: &str = "[2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666";
 const RPC_ADDR_ENV: &str = "PAQUS_RPC_ADDR";
 const DEFAULT_WALLET_PATH: &str = "wallet.json";
 const DEFAULT_TRANSACTION_FEE: u32 = 1;
+const DEFAULT_TRANSACTION_FEE_XPQ: &str = "0.01";
 const RPC_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +85,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         Some("new") => wallet_new(&args[1..]),
         Some("address") => wallet_address(&args[1..]),
         Some("balance") => wallet_balance(&args[1..]),
+        Some("stats") | Some("tracking") => wallet_global_stats(&args[1..]),
+        Some("address-stats") | Some("address-tracking") => wallet_address_stats(&args[1..]),
+        Some("hashrate") => wallet_hashrate(&args[1..]),
         Some("pay") => wallet_pay(&args[1..]),
         Some("send") => wallet_send(&args[1..]),
         Some(command) => Err(format!("unknown wallet command `{command}`. Try --help.")),
@@ -96,24 +101,26 @@ fn interactive_menu() -> Result<(), String> {
         println!("1. Create wallet");
         println!("2. Show wallet address");
         println!("3. Check wallet balance");
-        println!("4. Send coin");
-        println!("5. RPC health");
-        println!("6. RPC status");
-        println!("7. RPC peers");
-        println!("8. RPC chain");
-        println!("9. Latest blocks");
-        println!("10. Block by height");
-        println!("11. Block by hash");
-        println!("12. Transaction by hash");
-        println!("13. Address explorer");
-        println!("14. Accounts");
-        println!("15. Mempool");
-        println!("16. Change RPC for this session");
-        println!("17. Exit");
+        println!("4. Global chain stats");
+        println!("5. Send coin");
+        println!("6. RPC health");
+        println!("7. RPC status");
+        println!("8. RPC peers");
+        println!("9. RPC chain");
+        println!("10. Latest blocks");
+        println!("11. Block by height");
+        println!("12. Block by hash");
+        println!("13. Transaction by hash");
+        println!("14. Address explorer");
+        println!("15. Accounts");
+        println!("16. Mempool");
+        println!("17. Hashrate");
+        println!("18. Change RPC for this session");
+        println!("19. Exit");
         println!("Type b/back to return from prompts.");
 
         let choice = prompt("Select")?;
-        if choice == "17" {
+        if choice == "19" {
             return Ok(());
         }
         match handle_menu_choice(&choice) {
@@ -156,31 +163,36 @@ fn handle_menu_choice(choice: &str) -> Result<bool, String> {
             print_rpc_get(&rpc_addr, &format!("/balance/{}", wallet.wallet_address()))?;
             return Ok(true);
         }
-        "4" => return menu_send_coin(),
-        "5" => menu_rpc_get("/health")?,
-        "6" => menu_rpc_get("/status")?,
-        "7" => menu_rpc_get("/peers")?,
-        "8" => menu_rpc_get("/chain")?,
-        "9" => menu_rpc_get("/blocks/latest")?,
-        "10" => {
+        "4" => {
+            let rpc_addr = default_rpc_addr();
+            print_global_stats(&rpc_addr)?;
+            return Ok(true);
+        }
+        "5" => return menu_send_coin(),
+        "6" => menu_rpc_get("/health")?,
+        "7" => menu_rpc_get("/status")?,
+        "8" => menu_rpc_get("/peers")?,
+        "9" => menu_rpc_get("/chain")?,
+        "10" => menu_rpc_get("/blocks/latest")?,
+        "11" => {
             let Some(height) = prompt_back("Height")? else {
                 return Ok(false);
             };
             menu_rpc_get(&format!("/blocks/{height}"))?;
         }
-        "11" => {
+        "12" => {
             let Some(hash) = prompt_back("Block hash")? else {
                 return Ok(false);
             };
             menu_rpc_get(&format!("/blocks/hash/{hash}"))?;
         }
-        "12" => {
+        "13" => {
             let Some(hash) = prompt_back("Transaction hash")? else {
                 return Ok(false);
             };
             menu_rpc_get(&format!("/tx/{hash}"))?;
         }
-        "13" => {
+        "14" => {
             let Some(address) = prompt_default_back("Address", &default_wallet_address_or_empty())?
             else {
                 return Ok(false);
@@ -191,9 +203,10 @@ fn handle_menu_choice(choice: &str) -> Result<bool, String> {
                 menu_rpc_get(&format!("/address/{address}"))?;
             }
         }
-        "14" => menu_rpc_get("/accounts")?,
-        "15" => menu_rpc_get("/mempool")?,
-        "16" => {
+        "15" => menu_rpc_get("/accounts")?,
+        "16" => menu_rpc_get("/mempool")?,
+        "17" => menu_hashrate()?,
+        "18" => {
             let Some(rpc_addr) = prompt_default_back("RPC address", &default_rpc_addr())? else {
                 return Ok(false);
             };
@@ -215,10 +228,10 @@ fn menu_send_coin() -> Result<bool, String> {
     let Some(to) = prompt_back("Recipient address")? else {
         return Ok(false);
     };
-    let Some(amount) = prompt_back("Amount")? else {
+    let Some(amount) = prompt_back("Amount XPQ")? else {
         return Ok(false);
     };
-    let Some(fee) = prompt_default_back("Fee", &DEFAULT_TRANSACTION_FEE.to_string())? else {
+    let Some(fee) = prompt_default_back("Fee XPQ", DEFAULT_TRANSACTION_FEE_XPQ)? else {
         return Ok(false);
     };
     let Some(wallet_path) = prompt_default_back("Wallet file", DEFAULT_WALLET_PATH)? else {
@@ -243,9 +256,21 @@ fn menu_rpc_get(path: &str) -> Result<(), String> {
     print_rpc_get(&rpc_addr, path)
 }
 
+fn menu_hashrate() -> Result<(), String> {
+    let rpc_addr = default_rpc_addr();
+    print_hashrate(&status_value(&rpc_addr)?);
+    Ok(())
+}
+
 fn print_rpc_get(rpc_addr: &str, path: &str) -> Result<(), String> {
     let body = http_get(rpc_addr, path)?;
     print_rpc_response(path, &body)
+}
+
+fn status_value(rpc_addr: &str) -> Result<serde_json::Value, String> {
+    let body = http_get(rpc_addr, "/status")?;
+    serde_json::from_str(&body)
+        .map_err(|error| format!("failed to parse rpc status response: {error}: {body}"))
 }
 
 fn print_rpc_response(path: &str, body: &str) -> Result<(), String> {
@@ -257,6 +282,8 @@ fn print_rpc_response(path: &str, body: &str) -> Result<(), String> {
         print_status(&value);
     } else if path == "/chain" {
         print_chain(&value);
+    } else if path == "/stats" || path == "/chain/stats" {
+        print_chain_stats(&value);
     } else if path == "/peers" {
         print_peers(&value);
     } else if path.starts_with("/balance/") {
@@ -298,6 +325,15 @@ fn print_status(value: &serde_json::Value) {
     print_field("Outbound", value_text(value.get("outbound_peers")));
     print_field("Inbound", value_text(value.get("inbound_peers")));
     print_field("Mining", bool_text(value.get("mining")));
+    print_field("Hashrate", hashrate_text(value.get("hashrate_hps")));
+    print_field("Last attempts", value_text(value.get("last_mine_attempts")));
+}
+
+fn print_hashrate(value: &serde_json::Value) {
+    println!("Hashrate");
+    print_field("Mining", bool_text(value.get("mining")));
+    print_field("Hashrate", hashrate_text(value.get("hashrate_hps")));
+    print_field("Last attempts", value_text(value.get("last_mine_attempts")));
 }
 
 fn print_chain(value: &serde_json::Value) {
@@ -313,6 +349,37 @@ fn print_chain(value: &serde_json::Value) {
     print_field("Confirmation", value_text(value.get("confirmation_depth")));
     print_field("Finality", value_text(value.get("finality_depth")));
     print_field("Difficulty", value_text(value.get("difficulty_start")));
+}
+
+fn print_chain_stats(value: &serde_json::Value) {
+    println!("Global Chain Stats");
+    print_field("Chain", str_value(value.get("chain")));
+    print_field("Coin", str_value(value.get("coin")));
+    print_field("Tip height", value_text(value.get("height")));
+    print_field("Block count", value_text(value.get("blocks")));
+    print_field(
+        "Avg block",
+        duration_value_text(value.get("average_block_time_secs")),
+    );
+    print_field(
+        "Target block",
+        duration_value_text(value.get("target_block_time_secs")),
+    );
+    println!();
+    print_amount_field("Target supply", value.get("target_supply"));
+    print_amount_field("Current supply", value.get("current_supply"));
+    print_amount_field("Genesis premine", value.get("genesis_premine"));
+    print_amount_field("Mined supply", value.get("mined_supply"));
+    print_amount_field("Max mined", value.get("max_mined_supply"));
+    print_amount_field("Remaining", value.get("remaining_mined_supply"));
+    println!();
+    print_amount_field("Coinbase total", value.get("total_coinbase_rewards"));
+    print_amount_field("Fees collected", value.get("total_fees_collected"));
+    print_field("Tx count", value_text(value.get("total_transactions")));
+    print_field("Pending tx", value_text(value.get("pending_transactions")));
+    print_amount_field("Transfer vol", value.get("total_transfer_volume"));
+    print_amount_field("Tx fees", value.get("total_transaction_fees"));
+    print_amount_field("Avg transfer", value.get("average_transfer_amount"));
 }
 
 fn print_peers(value: &serde_json::Value) {
@@ -335,12 +402,12 @@ fn print_balance(value: &serde_json::Value) {
     print_field("Address", short_value(value.get("address")));
     print_field("Height", value_text(value.get("height")));
     print_field("Exists", bool_text(value.get("exists")));
-    print_field("Confirmed", value_text(value.get("confirmed")));
-    print_field("Available", value_text(value.get("available")));
-    print_field("Incoming", value_text(value.get("pending_incoming")));
-    print_field("Outgoing", value_text(value.get("pending_outgoing")));
+    print_amount_field("Confirmed", value.get("confirmed"));
+    print_amount_field("Available", value.get("available"));
+    print_amount_field("Incoming", value.get("pending_incoming"));
+    print_amount_field("Outgoing", value.get("pending_outgoing"));
     print_field("Nonce", value_text(value.get("nonce")));
-    print_field("Unspendable", value_text(value.get("unspendable")));
+    print_amount_field("Unspendable", value.get("unspendable"));
 }
 
 fn print_latest_blocks(value: &serde_json::Value) {
@@ -381,15 +448,15 @@ fn print_block_with_context(
     print_field("Age", block_age_text(value));
     print_field("Target", target_block_time_text(value));
     print_field("Block Mined", block_mined_text(value, previous_timestamp));
-    print_field("Value Moved", value_moved_text(value));
+    print_amount_text_field("Value Moved", value_moved_text(value));
     print_field("Block Nonce", value_text(value.get("nonce")));
     print_field("Tx count", value_text(value.get("tx_count")));
     print_field("Size", format!("{} bytes", value_text(value.get("size"))));
     if let Some(coinbase) = value.get("coinbase").and_then(serde_json::Value::as_object) {
-        let total = value_text(coinbase.get("total"));
+        let total = amount_text(coinbase.get("total"));
         let to = short_value(coinbase.get("to"));
         print_field("Coinbase", format!("{total} to {to}"));
-        print_field("Fees", value_text(coinbase.get("fees")));
+        print_amount_field("Fees", coinbase.get("fees"));
     }
     print_field("Timestamp", value_text(value.get("timestamp")));
     print_transactions(value.get("transactions"));
@@ -407,7 +474,28 @@ fn print_address(value: &serde_json::Value) {
         println!();
         print_balance(balance);
     }
+    print_mined_blocks(value.get("mined_blocks"));
     print_transactions(value.get("transactions"));
+}
+
+fn print_mined_blocks(value: Option<&serde_json::Value>) {
+    let Some(blocks) = value.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    println!();
+    println!("Mined Blocks ({})", blocks.len());
+    for (index, block) in blocks.iter().enumerate() {
+        println!();
+        println!("Mined #{}", index + 1);
+        print_field("Height", value_text(block.get("height")));
+        print_field("Hash", short_value(block.get("hash")));
+        print_field("Matured", bool_text(block.get("matured")));
+        print_field("Matures at", value_text(block.get("maturity_height")));
+        print_amount_field("Subsidy", block.get("subsidy"));
+        print_amount_field("Fees", block.get("fees"));
+        print_amount_field("Total", block.get("total"));
+        print_field("Tx count", value_text(block.get("tx_count")));
+    }
 }
 
 fn print_accounts(value: &serde_json::Value) {
@@ -420,11 +508,11 @@ fn print_accounts(value: &serde_json::Value) {
         println!();
         println!("Account #{}", index + 1);
         print_field("Address", short_value(account.get("address")));
-        print_field("Confirmed", value_text(account.get("confirmed")));
-        print_field("Available", value_text(account.get("available")));
-        print_field("Unspendable", value_text(account.get("unspendable")));
-        print_field("Incoming", value_text(account.get("pending_incoming")));
-        print_field("Outgoing", value_text(account.get("pending_outgoing")));
+        print_amount_field("Confirmed", account.get("confirmed"));
+        print_amount_field("Available", account.get("available"));
+        print_amount_field("Unspendable", account.get("unspendable"));
+        print_amount_field("Incoming", account.get("pending_incoming"));
+        print_amount_field("Outgoing", account.get("pending_outgoing"));
         print_field("Nonce", value_text(account.get("nonce")));
         print_field("Credits", value_text(account.get("credits")));
     }
@@ -453,8 +541,8 @@ fn print_tx_fields(value: &serde_json::Value) {
     print_field("Hash", short_value(value.get("hash")));
     print_field("From", short_value(value.get("from")));
     print_field("To", short_value(value.get("to")));
-    print_field("Amount", value_text(value.get("amount")));
-    print_field("Fee", value_text(value.get("fee")));
+    print_amount_field("Amount", value.get("amount"));
+    print_amount_field("Fee", value.get("fee"));
     print_field("Nonce", value_text(value.get("nonce")));
     print_field("Height", value_text(value.get("block_height")));
     print_field("Block", short_value(value.get("block_hash")));
@@ -463,6 +551,14 @@ fn print_tx_fields(value: &serde_json::Value) {
 
 fn print_field(label: &str, value: impl std::fmt::Display) {
     println!("{label:<13} : {value}");
+}
+
+fn print_amount_field(label: &str, value: Option<&serde_json::Value>) {
+    print_field(label, amount_text(value));
+}
+
+fn print_amount_text_field(label: &str, value: impl AsRef<str>) {
+    print_field(label, amount_units_text(value.as_ref()));
 }
 
 fn print_pretty_json(value: &serde_json::Value) {
@@ -478,6 +574,47 @@ fn value_text(value: Option<&serde_json::Value>) -> String {
         Some(serde_json::Value::String(value)) => value.clone(),
         Some(value) => value.to_string(),
     }
+}
+
+fn duration_value_text(value: Option<&serde_json::Value>) -> String {
+    let Some(seconds) = value.and_then(serde_json::Value::as_u64) else {
+        return "none".to_string();
+    };
+    format_duration(seconds)
+}
+
+fn amount_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::Number(number)) => amount_units_text(&number.to_string()),
+        Some(serde_json::Value::String(value)) => amount_units_text(value),
+        Some(serde_json::Value::Null) | None => "none".to_string(),
+        Some(value) => amount_units_text(&value.to_string()),
+    }
+}
+
+fn amount_units_text(value: &str) -> String {
+    let Ok(units) = value.parse::<u64>() else {
+        return value.to_string();
+    };
+    format_xpq(units)
+}
+
+fn format_xpq(units: u64) -> String {
+    let whole = units / XPQ as u64;
+    let fractional = units % XPQ as u64;
+    format!("{}.{fractional:02} XPQ", format_grouped_u64(whole))
+}
+
+fn format_grouped_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn block_age_text(value: &serde_json::Value) -> String {
@@ -555,6 +692,32 @@ fn value_moved_text(value: &serde_json::Value) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn hashrate_text(value: Option<&serde_json::Value>) -> String {
+    let Some(hashrate) = value.and_then(serde_json::Value::as_u64) else {
+        return "unknown".to_string();
+    };
+    format_hashrate(hashrate)
+}
+
+fn format_hashrate(hashrate: u64) -> String {
+    let units = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s"];
+    let mut value = hashrate as f64;
+    let mut unit = units[0];
+    for next_unit in units.iter().skip(1) {
+        if value < 1_000.0 {
+            break;
+        }
+        value /= 1_000.0;
+        unit = next_unit;
+    }
+
+    if unit == units[0] {
+        format!("{hashrate} {unit}")
+    } else {
+        format!("{value:.2} {unit}")
+    }
+}
+
 fn format_duration(seconds: u64) -> String {
     match seconds {
         0..=59 => format!("{seconds} sec"),
@@ -593,7 +756,7 @@ fn str_value(value: Option<&serde_json::Value>) -> String {
 }
 
 fn short_value(value: Option<&serde_json::Value>) -> String {
-    short_text(&str_value(value))
+    str_value(value)
 }
 
 fn bool_text(value: Option<&serde_json::Value>) -> &'static str {
@@ -605,11 +768,7 @@ fn bool_text(value: Option<&serde_json::Value>) -> &'static str {
 }
 
 fn short_text(value: &str) -> String {
-    if value.len() <= 24 || value == "none" {
-        value.to_string()
-    } else {
-        format!("{}...{}", &value[..8], &value[value.len() - 8..])
-    }
+    value.to_string()
 }
 
 fn wallet_new(args: &[String]) -> Result<(), String> {
@@ -699,6 +858,274 @@ fn wallet_balance(args: &[String]) -> Result<(), String> {
         )?
     );
     Ok(())
+}
+
+fn wallet_global_stats(args: &[String]) -> Result<(), String> {
+    let mut rpc_addr = default_rpc_addr();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            value => return Err(format!("unknown wallet stats option `{value}`")),
+        }
+        index += 1;
+    }
+
+    print_global_stats(&rpc_addr)
+}
+
+fn print_global_stats(rpc_addr: &str) -> Result<(), String> {
+    let body = http_get(rpc_addr, "/stats")?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("failed to parse stats rpc response: {error}: {body}"))?;
+    print_chain_stats(&value);
+    Ok(())
+}
+
+fn wallet_address_stats(args: &[String]) -> Result<(), String> {
+    let mut address = None;
+    let mut wallet_path = DEFAULT_WALLET_PATH.to_string();
+    let mut rpc_addr = default_rpc_addr();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--wallet" => {
+                index += 1;
+                wallet_path = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --wallet".to_string())?
+                    .clone();
+            }
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            value if !value.starts_with('-') && address.is_none() => {
+                address = Some(parse_address(args.get(index))?);
+            }
+            value => return Err(format!("unknown wallet address-stats option `{value}`")),
+        }
+        index += 1;
+    }
+
+    let address = match address {
+        Some(address) => address,
+        None => load_wallet(&wallet_path)?.address,
+    };
+
+    print_wallet_stats(&rpc_addr, &address)
+}
+
+fn print_wallet_stats(rpc_addr: &str, address: &Address) -> Result<(), String> {
+    let address_hex = address_to_string(address);
+    let body = http_get(rpc_addr, &format!("/address/{address_hex}"))?;
+    let response: AddressRpcResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("failed to parse address rpc response: {error}: {body}"))?;
+    let stats = WalletStats::from_response(&response);
+
+    println!("Wallet Tracking");
+    print_field("Address", short_text(&response.address));
+    print_field("Height", response.balance.height);
+    print_field(
+        "Confirmed",
+        amount_units_text(&response.balance.confirmed.to_string()),
+    );
+    print_field(
+        "Available",
+        amount_units_text(&response.balance.available.to_string()),
+    );
+    print_field(
+        "Unspendable",
+        amount_units_text(&response.balance.unspendable.to_string()),
+    );
+    print_field(
+        "Incoming",
+        amount_units_text(&response.balance.pending_incoming.to_string()),
+    );
+    print_field(
+        "Outgoing",
+        amount_units_text(&response.balance.pending_outgoing.to_string()),
+    );
+    print_field("Nonce", optional_u64_text(response.balance.nonce));
+    println!();
+    print_field("Mined blocks", stats.mined_blocks);
+    print_field("Maturity", format!("{BLOCK_REWARD_MATURITY} blocks"));
+    print_field(
+        "Mined total",
+        amount_units_text(&stats.mined_total.to_string()),
+    );
+    print_field(
+        "Matured mined",
+        amount_units_text(&stats.matured_mined.to_string()),
+    );
+    print_field(
+        "Immature mined",
+        amount_units_text(&stats.immature_mined.to_string()),
+    );
+    print_field(
+        "Mining fees",
+        amount_units_text(&stats.mining_fees.to_string()),
+    );
+    print_field(
+        "Next maturity",
+        optional_u64_text(stats.next_maturity_height),
+    );
+    println!();
+    print_field("Tx count", stats.total_transactions);
+    print_field("Received tx", stats.received_transactions);
+    print_field("Sent tx", stats.sent_transactions);
+    print_field(
+        "Received total",
+        amount_units_text(&stats.received_total.to_string()),
+    );
+    print_field(
+        "Sent total",
+        amount_units_text(&stats.sent_total.to_string()),
+    );
+    print_field("Fees sent", amount_units_text(&stats.sent_fees.to_string()));
+    print_field("Pending tx", stats.pending_transactions);
+    Ok(())
+}
+
+fn wallet_hashrate(args: &[String]) -> Result<(), String> {
+    let mut rpc_addr = default_rpc_addr();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--rpc" | "--rpc-addr" => {
+                index += 1;
+                rpc_addr = args
+                    .get(index)
+                    .ok_or_else(|| "missing value for --rpc".to_string())?
+                    .clone();
+            }
+            value => return Err(format!("unknown wallet hashrate option `{value}`")),
+        }
+        index += 1;
+    }
+
+    print_hashrate(&status_value(&rpc_addr)?);
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AddressRpcResponse {
+    address: String,
+    balance: AddressBalanceRpcResponse,
+    #[serde(default)]
+    mined_blocks: Vec<MinedBlockRpcResponse>,
+    #[serde(default)]
+    transactions: Vec<TransactionRpcResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddressBalanceRpcResponse {
+    height: u64,
+    confirmed: u64,
+    available: u64,
+    pending_incoming: u64,
+    pending_outgoing: u64,
+    nonce: Option<u64>,
+    #[serde(default)]
+    unspendable: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MinedBlockRpcResponse {
+    #[serde(default)]
+    maturity_height: u64,
+    #[serde(default = "default_block_reward_maturity")]
+    matured: bool,
+    #[serde(default)]
+    fees: u64,
+    #[serde(default)]
+    total: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransactionRpcResponse {
+    from: String,
+    to: String,
+    amount: u64,
+    fee: u64,
+    status: String,
+}
+
+#[derive(Debug, Default)]
+struct WalletStats {
+    mined_blocks: u64,
+    mined_total: u64,
+    matured_mined: u64,
+    immature_mined: u64,
+    mining_fees: u64,
+    next_maturity_height: Option<u64>,
+    total_transactions: u64,
+    received_transactions: u64,
+    sent_transactions: u64,
+    received_total: u64,
+    sent_total: u64,
+    sent_fees: u64,
+    pending_transactions: u64,
+}
+
+impl WalletStats {
+    fn from_response(response: &AddressRpcResponse) -> Self {
+        let mut stats = Self::default();
+        stats.mined_blocks = response.mined_blocks.len() as u64;
+        for block in &response.mined_blocks {
+            stats.mined_total = stats.mined_total.saturating_add(block.total);
+            stats.mining_fees = stats.mining_fees.saturating_add(block.fees);
+            if block.matured {
+                stats.matured_mined = stats.matured_mined.saturating_add(block.total);
+            } else {
+                stats.immature_mined = stats.immature_mined.saturating_add(block.total);
+                stats.next_maturity_height = match stats.next_maturity_height {
+                    Some(height) => Some(height.min(block.maturity_height)),
+                    None => Some(block.maturity_height),
+                };
+            }
+        }
+
+        for transaction in &response.transactions {
+            stats.total_transactions = stats.total_transactions.saturating_add(1);
+            if transaction.status == "pending" {
+                stats.pending_transactions = stats.pending_transactions.saturating_add(1);
+            }
+            if transaction.to == response.address {
+                stats.received_transactions = stats.received_transactions.saturating_add(1);
+                stats.received_total = stats.received_total.saturating_add(transaction.amount);
+            }
+            if transaction.from == response.address {
+                stats.sent_transactions = stats.sent_transactions.saturating_add(1);
+                stats.sent_total = stats.sent_total.saturating_add(transaction.amount);
+                stats.sent_fees = stats.sent_fees.saturating_add(transaction.fee);
+            }
+        }
+
+        stats
+    }
+}
+
+fn default_block_reward_maturity() -> bool {
+    false
+}
+
+fn optional_u64_text(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn wallet_pay(args: &[String]) -> Result<(), String> {
@@ -983,10 +1410,64 @@ fn parse_address_hex(value: &str) -> Result<Address, String> {
 
 fn parse_amount(value: Option<&String>, flag: &str) -> Result<Amount, String> {
     let value = value.ok_or_else(|| format!("missing value for {flag}"))?;
-    value
-        .parse::<u32>()
-        .map(Amount)
-        .map_err(|error| format!("invalid amount for {flag}: {error}"))
+    parse_xpq_amount(value).map_err(|error| format!("invalid XPQ amount for {flag}: {error}"))
+}
+
+fn parse_xpq_amount(value: &str) -> Result<Amount, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("amount is empty".to_string());
+    }
+    if value.starts_with('-') {
+        return Err("amount cannot be negative".to_string());
+    }
+
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fractional = parts.next();
+    if parts.next().is_some() {
+        return Err("amount has more than one decimal point".to_string());
+    }
+    if whole.is_empty() && fractional.is_none_or(str::is_empty) {
+        return Err("amount is empty".to_string());
+    }
+    if !whole.chars().all(|character| character.is_ascii_digit()) {
+        return Err("whole XPQ part must contain digits only".to_string());
+    }
+
+    let whole_units = if whole.is_empty() {
+        0u64
+    } else {
+        whole
+            .parse::<u64>()
+            .map_err(|error| format!("whole XPQ part is too large: {error}"))?
+    };
+
+    let fractional_units = match fractional {
+        Some("") | None => 0u64,
+        Some(value) => {
+            if value.len() > 2 {
+                return Err("XPQ supports at most 2 decimal places".to_string());
+            }
+            if !value.chars().all(|character| character.is_ascii_digit()) {
+                return Err("fractional XPQ part must contain digits only".to_string());
+            }
+            let mut padded = value.to_string();
+            while padded.len() < 2 {
+                padded.push('0');
+            }
+            padded
+                .parse::<u64>()
+                .map_err(|error| format!("fractional XPQ part is invalid: {error}"))?
+        }
+    };
+
+    let units = whole_units
+        .checked_mul(XPQ as u64)
+        .and_then(|units| units.checked_add(fractional_units))
+        .ok_or_else(|| "amount is too large".to_string())?;
+    let units = u32::try_from(units).map_err(|_| "amount exceeds protocol limit".to_string())?;
+    Ok(Amount(units))
 }
 
 fn parse_nonce(value: Option<&String>) -> Result<Nonce, String> {
@@ -1173,13 +1654,16 @@ Usage:
   paqus-wallet new [wallet-path] [--show-secret]
   paqus-wallet address <secret-key-hex>
   paqus-wallet balance [address-hex] [--wallet path] [--rpc host:port]
-  paqus-wallet pay <address-hex> <amount> [--wallet path] [--fee units] [--rpc host:port]
-  paqus-wallet send <address-hex> <amount> [--wallet path] [--nonce n] [--fee units] [--rpc host:port]
-  paqus-wallet send [--wallet path] --to address-hex --amount units [--nonce n] [--fee units] [--submit] [--rpc host:port]
+  paqus-wallet stats [--rpc host:port]
+  paqus-wallet address-stats [address-hex] [--wallet path] [--rpc host:port]
+  paqus-wallet hashrate [--rpc host:port]
+  paqus-wallet pay <address-hex> <amount-xpq> [--wallet path] [--fee xpq] [--rpc host:port]
+  paqus-wallet send <address-hex> <amount-xpq> [--wallet path] [--nonce n] [--fee xpq] [--rpc host:port]
+  paqus-wallet send [--wallet path] --to address-hex --amount xpq [--nonce n] [--fee xpq] [--submit] [--rpc host:port]
 
 Defaults:
   Wallet path: wallet.json
-  RPC address: $PAQUS_RPC_ADDR or [2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666
+  RPC address: $PAQUS_RPC_ADDR or [2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666
 "
     );
 }
