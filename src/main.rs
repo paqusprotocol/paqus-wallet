@@ -1679,7 +1679,7 @@ Usage:
 
 Defaults:
   Wallet path: wallet.json
-  RPC address: $PAQUS_RPC_ADDR or [2404:8000:1044:4d8:822b:f9ff:fee2:365]:6666
+  RPC address: $PAQUS_RPC_ADDR or [2404:8000:1044:4d8:1202:b5ff:feb0:7020]:6666
 "
     );
 }
